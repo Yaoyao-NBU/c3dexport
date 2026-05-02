@@ -27,7 +27,7 @@ import copy
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from transform_utils import (
-    compute_kistler_channel8,
+    compute_forceplate_type3,
     plate_local_to_lab,
     lab_to_opensim_force,
     butter_lowpass_filter,
@@ -126,7 +126,7 @@ def extract_plate2_data(c3d_path, plate_idx=1):
     a   = float(origin[0, plate_idx])
     b   = float(origin[1, plate_idx])
     az0 = float(origin[2, plate_idx])
-    t2 = compute_kistler_channel8(ch8, a, b, az0)
+    t2 = compute_forceplate_type3(ch8, a, b, az0)
 
     # Lab → OpenSim
     plate_corners = corners[:, :, plate_idx]

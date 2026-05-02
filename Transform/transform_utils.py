@@ -87,15 +87,90 @@ def apply_rotation(data_3xN, R):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Kistler Type 3 → Type 2  Force-Plate Computation
+#  Force-Plate Computation (Type 1 / Type 2 / Type 3)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FZ_THRESHOLD = 20.0   # N — COP / Tz set to 0 when |Fz| below this
 
 
-def compute_kistler_channel8(channels_8, a, b, az0):
+def _compute_cop_and_free_moment(Fx_raw, Fy_raw, Fz_raw, Mx, My, Mz, az0):
+    """Compute COP and free vertical moment from raw forces and moments.
+
+    Shared computation for Type 2 and Type 3 force plates.
     """
-    Compute Type 2 force-plate data from 8-channel Kistler Type 3 raw data.
+    Mxp = Mx + Fy_raw * az0
+    Myp = My - Fx_raw * az0
+
+    valid = np.abs(Fz_raw) >= FZ_THRESHOLD
+    with np.errstate(invalid='ignore', divide='ignore'):
+        ax = np.where(valid, -Myp / Fz_raw, 0.0)
+        ay = np.where(valid,  Mxp / Fz_raw, 0.0)
+
+    Tz_raw = Mz - Fy_raw * ax + Fx_raw * ay
+    Tz = np.where(valid, -Tz_raw, 0.0)
+
+    return dict(Fx=-Fx_raw, Fy=-Fy_raw, Fz=-Fz_raw, ax=ax, ay=ay, Tz=Tz)
+
+
+def compute_forceplate_type1(channels_6, az0):
+    """
+    Compute force-plate data from Type 1 (6-channel direct measurement).
+
+    Type 1 outputs forces and COP directly — no moment-to-COP conversion.
+    Only the free vertical moment Tz is derived from Mz.
+
+    Parameters
+    ----------
+    channels_6 : ndarray (6, N)
+        [Fx, Fy, Fz, Px, Py, Mz] in plate-local coords
+        Px, Py are COP coordinates (mm); Mz is free vertical moment
+    az0 : float — top-plate offset, mm (typically negative)
+
+    Returns
+    -------
+    dict  Fx, Fy, Fz (N, ground reaction),
+          ax, ay (mm, COP from plate centre),
+          Tz (N*mm, free vertical moment)
+    """
+    Fx_raw, Fy_raw, Fz_raw, Px, Py, Mz = channels_6
+
+    valid = np.abs(Fz_raw) >= FZ_THRESHOLD
+    ax = np.where(valid, Px, 0.0)
+    ay = np.where(valid, Py, 0.0)
+    Tz = np.where(valid, -Mz, 0.0)
+
+    return dict(Fx=-Fx_raw, Fy=-Fy_raw, Fz=-Fz_raw, ax=ax, ay=ay, Tz=Tz)
+
+
+def compute_forceplate_type2(channels_6, az0):
+    """
+    Compute force-plate data from Type 2 (6-channel with moments).
+
+    Type 2 outputs forces and moments — COP is computed by transferring
+    moments to the plate surface.
+
+    Parameters
+    ----------
+    channels_6 : ndarray (6, N)
+        [Fx, Fy, Fz, Mx, My, Mz] in plate-local coords
+    az0 : float — top-plate offset, mm (typically negative)
+
+    Returns
+    -------
+    dict  Fx, Fy, Fz (N, ground reaction),
+          ax, ay (mm, COP from plate centre),
+          Tz (N*mm, free vertical moment)
+    """
+    Fx_raw, Fy_raw, Fz_raw, Mx, My, Mz = channels_6
+    return _compute_cop_and_free_moment(Fx_raw, Fy_raw, Fz_raw, Mx, My, Mz, az0)
+
+
+def compute_forceplate_type3(channels_8, a, b, az0):
+    """
+    Compute force-plate data from Type 3 (8-channel Kistler).
+
+    Type 3 uses 4 sensor groups; forces and moments are first computed from
+    the raw channel data using Kistler geometry, then COP and Tz are derived.
 
     Parameters
     ----------
@@ -107,9 +182,9 @@ def compute_kistler_channel8(channels_8, a, b, az0):
 
     Returns
     -------
-    dict  Fx, Fy, Fz  (N, ground reaction),
-          ax, ay      (mm, COP from plate centre),
-          Tz          (N·mm, free vertical moment)
+    dict  Fx, Fy, Fz (N, ground reaction),
+          ax, ay (mm, COP from plate centre),
+          Tz (N*mm, free vertical moment)
     """
     fx12, fx34, fy14, fy23, fz1, fz2, fz3, fz4 = channels_8
 
@@ -121,60 +196,7 @@ def compute_kistler_channel8(channels_8, a, b, az0):
     My = a * (-fz1 + fz2 + fz3 - fz4)
     Mz = b * (-fx12 + fx34) + a * (fy14 - fy23)
 
-    # Transfer moments to plate surface
-    Mxp = Mx + Fy_raw * az0
-    Myp = My - Fx_raw * az0
-
-    # COP (valid only when |Fz| ≥ threshold)
-    valid = np.abs(Fz_raw) >= FZ_THRESHOLD
-    with np.errstate(invalid='ignore', divide='ignore'):
-        ax = np.where(valid, -Myp / Fz_raw, 0.0)
-        ay = np.where(valid,  Mxp / Fz_raw, 0.0)
-
-    # Free vertical moment
-    Tz_raw = Mz - Fy_raw * ax + Fx_raw * ay
-    Tz = np.where(valid, -Tz_raw, 0.0)
-
-    # Negate to get ground reaction force (from ground ON the person)
-    return dict(Fx=-Fx_raw, Fy=-Fy_raw, Fz=-Fz_raw, ax=ax, ay=ay, Tz=Tz)
-
-
-def compute_kistler_channel6(channels_6 , az0):
-    """
-    Compute COP and free moment from 6-channel force-plate data (Fx, Fy, Fz, Mx, My, Mz).
-
-    The input data is already in Kistler plate-local coordinates:
-      X=right+, Y=posterior+, Z=down+
-
-    Parameters
-    ----------
-    channels_6 : ndarray (6, N)
-        [Fx, Fy, Fz, Mx, My, Mz] — forces and moments in Kistler local coords
-
-    Returns
-    -------
-    dict  Fx, Fy, Fz  (N, ground reaction forces),
-          ax, ay      (N, mm, COP from plate centre),
-          Tz          (N, N·mm, free vertical moment)
-    """
-    Fx_raw, Fy_raw, Fz_raw, Mx, My, Mz = channels_6
-
-    Mxp = Mx + Fy_raw * az0
-    Myp = My - Fx_raw * az0
-    # COP (valid only when |Fz| ≥ threshold)
-    # Note: COP is computed from the given moments, assuming they are already
-    # at the plate surface or at the measurement reference point
-    valid = np.abs(Fz_raw) >= FZ_THRESHOLD
-    with np.errstate(invalid='ignore', divide='ignore'):
-        ax = np.where(valid, -Myp / Fz_raw, 0.0)
-        ay = np.where(valid,  Mxp / Fz_raw, 0.0)
-
-    # Free vertical moment (moment about the COP)
-    Tz_raw = Mz - Fy_raw * ax + Fx_raw * ay
-    Tz = np.where(valid, -Tz_raw, 0.0)
-
-    # Negate to get ground reaction force (from ground ON the person)
-    return dict(Fx=-Fx_raw, Fy=-Fy_raw, Fz=-Fz_raw, ax=ax, ay=ay, Tz=Tz)
+    return _compute_cop_and_free_moment(Fx_raw, Fy_raw, Fz_raw, Mx, My, Mz, az0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

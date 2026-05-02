@@ -22,8 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from transform_utils import (
     rotation_matrix, apply_rotation,
-    compute_kistler_channel8,
-    compute_kistler_channel6,
+    compute_forceplate_type3,
+    compute_forceplate_type2,
     plate_local_to_lab,
     lab_to_opensim_force,
     butter_lowpass_filter,
@@ -147,7 +147,7 @@ def process_c3d_v2(c3d_path, output_dir,
         b   = float(origin[1, pi])
         az0 = float(origin[2, pi])
 
-        t2 = compute_kistler_channel8(ch8, a, b, az0)
+        t2 = compute_forceplate_type3(ch8, a, b, az0)
         plate_type2.append(t2)
         print(f"  FP{pi+1}: a={a:.0f}mm, b={b:.0f}mm, az0={az0:.0f}mm")
 

@@ -311,23 +311,61 @@ Apply a 3x3 rotation matrix to (3, N) data.
 
 ---
 
-### Kistler Force-Plate Computation
+### Force-Plate Computation (Type 1 / Type 2 / Type 3)
 
-#### `compute_kistler_channel8(channels_8, a, b, az0)`
+#### `compute_forceplate_type1(channels_6, az0)`
 
-Compute Type 2 force-plate data from **8-channel Kistler Type 3** raw data.
+Compute force-plate data from **Type 1** (6-channel direct measurement).
+
+Type 1 outputs forces and COP directly -- no moment-to-COP conversion needed. Only the free vertical moment Tz is derived from Mz.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `channels_8` | `ndarray (8, N)` | Raw channels: `[fx12, fx34, fy14, fy23, fz1, fz2, fz3, fz4]` |
-| `a` | `float` | Sensor offset in local-Y (AP direction), mm |
-| `b` | `float` | Sensor offset in local-X (ML direction), mm |
+| `channels_6` | `ndarray (6, N)` | Channels: `[Fx, Fy, Fz, Px, Py, Mz]` (Px, Py are COP in mm) |
 | `az0` | `float` | Top-plate offset, mm (typically negative) |
 
 **Returns:** `dict` with keys:
 - `Fx`, `Fy`, `Fz` (`ndarray`): Ground reaction forces (N)
 - `ax`, `ay` (`ndarray`): COP coordinates from plate center (mm)
 - `Tz` (`ndarray`): Free vertical moment (N*mm)
+
+---
+
+#### `compute_forceplate_type2(channels_6, az0)`
+
+Compute force-plate data from **Type 2** (6-channel with moments).
+
+Type 2 outputs forces and moments -- COP is computed by transferring moments to the plate surface.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `channels_6` | `ndarray (6, N)` | Channels: `[Fx, Fy, Fz, Mx, My, Mz]` |
+| `az0` | `float` | Top-plate offset, mm (typically negative) |
+
+**Returns:** `dict` with same keys as `compute_forceplate_type1`
+
+**Algorithm:**
+1. Transfer moments to plate surface: `Mxp = Mx + Fy*az0`, `Myp = My - Fx*az0`
+2. Compute COP: `ax = -Myp/Fz`, `ay = Mxp/Fz` (valid only when |Fz| >= 20N)
+3. Compute free vertical moment: `Tz = Mz - Fy*ax + Fx*ay`
+4. Negate to get ground reaction force convention
+
+---
+
+#### `compute_forceplate_type3(channels_8, a, b, az0)`
+
+Compute force-plate data from **Type 3** (8-channel Kistler).
+
+Type 3 uses 4 sensor groups; forces and moments are first computed from the raw channel data using Kistler geometry, then COP and Tz are derived the same way as Type 2.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `channels_8` | `ndarray (8, N)` | Channels: `[fx12, fx34, fy14, fy23, fz1, fz2, fz3, fz4]` |
+| `a` | `float` | Sensor offset in local-Y (AP direction), mm |
+| `b` | `float` | Sensor offset in local-X (ML direction), mm |
+| `az0` | `float` | Top-plate offset, mm (typically negative) |
+
+**Returns:** `dict` with same keys as `compute_forceplate_type1`
 
 **Algorithm:**
 1. Sum raw channels to get Fx_raw, Fy_raw, Fz_raw
@@ -336,19 +374,6 @@ Compute Type 2 force-plate data from **8-channel Kistler Type 3** raw data.
 4. Compute COP: `ax = -Myp/Fz`, `ay = Mxp/Fz` (valid only when |Fz| >= 20N)
 5. Compute free vertical moment: `Tz = Mz - Fy*ax + Fx*ay`
 6. Negate to get ground reaction force convention
-
----
-
-#### `compute_kistler_channel6(channels_6, az0)`
-
-Compute COP and free moment from **6-channel** force-plate data.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `channels_6` | `ndarray (6, N)` | Raw channels: `[Fx, Fy, Fz, Mx, My, Mz]` |
-| `az0` | `float` | Top-plate offset, mm |
-
-**Returns:** `dict` with same keys as `compute_kistler_channel8`
 
 ---
 
@@ -365,7 +390,7 @@ Convert force data from Kistler plate-local to lab global coordinates.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `type2` | `dict` | Output of `compute_kistler_channel8` or `compute_kistler_channel6` |
+| `type2` | `dict` | Output of `compute_forceplate_type1`, `type2`, or `type3` |
 | `corners` | `ndarray (3, 4)` | Force plate corners from C3D `FORCE_PLATFORM:CORNERS` |
 
 **Returns:** `dict` with keys: `Fx`, `Fy`, `Fz` (N), `COPx`, `COPy`, `COPz` (mm), `Tz` (N*mm)

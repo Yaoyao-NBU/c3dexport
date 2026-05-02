@@ -15,7 +15,7 @@ import ezc3d
 
 from .utils import (
     rotation_matrix, apply_rotation,
-    compute_kistler_channel8, compute_kistler_channel6,
+    compute_forceplate_type2, compute_forceplate_type3,
     plate_local_to_lab, lab_to_opensim_force,
     butter_lowpass_filter, resample_to_target_rate,
     detect_stance_phase, detect_stance_phase_from_peak,
@@ -90,7 +90,7 @@ def _resample_analog(analog_data, analog_rate, point_rate, n_point_frames):
 
 
 def _compute_type2_8ch(analog_data, channels, origin, n_plates):
-    """Compute Type 2 force data from 8-channel Kistler raw data."""
+    """Compute force data from 8-channel Kistler raw data (Type 3)."""
     plate_type2 = []
     for pi in range(n_plates):
         ch_idx = channels[:, pi].astype(int) - 1
@@ -98,18 +98,18 @@ def _compute_type2_8ch(analog_data, channels, origin, n_plates):
         a   = float(origin[0, pi])
         b   = float(origin[1, pi])
         az0 = float(origin[2, pi])
-        plate_type2.append(compute_kistler_channel8(ch8, a, b, az0))
+        plate_type2.append(compute_forceplate_type3(ch8, a, b, az0))
     return plate_type2
 
 
 def _compute_type2_6ch(analog_data, channels, origin, n_plates):
-    """Compute Type 2 force data from 6-channel raw data."""
+    """Compute force data from 6-channel raw data (Type 2)."""
     plate_type2 = []
     for pi in range(n_plates):
         ch_idx = channels[:, pi].astype(int) - 1
         ch6    = analog_data[ch_idx, :]
         az0    = float(origin[2, pi])
-        plate_type2.append(compute_kistler_channel6(ch6, az0))
+        plate_type2.append(compute_forceplate_type2(ch6, az0))
     return plate_type2
 
 

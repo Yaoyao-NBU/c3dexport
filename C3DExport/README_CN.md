@@ -312,23 +312,61 @@ R = chain_rotations(('X', -90), ('Y', 90))
 
 ---
 
-### Kistler 测力台计算
+### 测力台计算（Type 1 / Type 2 / Type 3）
 
-#### `compute_kistler_channel8(channels_8, a, b, az0)`
+#### `compute_forceplate_type1(channels_6, az0)`
 
-从 **8 通道 Kistler Type 3** 原始数据计算 Type 2 测力台数据。
+从 **Type 1**（6 通道直接测量）计算测力台数据。
+
+Type 1 直接输出力和压力中心坐标——无需力矩到压力中心的转换。仅自由垂直力矩 Tz 需要从 Mz 推导。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `channels_8` | `ndarray (8, N)` | 原始通道：`[fx12, fx34, fy14, fy23, fz1, fz2, fz3, fz4]` |
-| `a` | `float` | 局部 Y 方向传感器偏移量（前后方向），mm |
-| `b` | `float` | 局部 X 方向传感器偏移量（内外方向），mm |
+| `channels_6` | `ndarray (6, N)` | 通道：`[Fx, Fy, Fz, Px, Py, Mz]`（Px, Py 为压力中心坐标，mm） |
 | `az0` | `float` | 顶板偏移量，mm（通常为负值） |
 
 **返回值：** `dict`，包含以下键：
 - `Fx`, `Fy`, `Fz` (`ndarray`): 地面反作用力（N）
 - `ax`, `ay` (`ndarray`): 压力中心距测力台中心的坐标（mm）
 - `Tz` (`ndarray`): 自由垂直力矩（N*mm）
+
+---
+
+#### `compute_forceplate_type2(channels_6, az0)`
+
+从 **Type 2**（6 通道含力矩）计算测力台数据。
+
+Type 2 输出力和力矩——通过将力矩转移到板面来计算压力中心。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `channels_6` | `ndarray (6, N)` | 通道：`[Fx, Fy, Fz, Mx, My, Mz]` |
+| `az0` | `float` | 顶板偏移量，mm（通常为负值） |
+
+**返回值：** `dict`，与 `compute_forceplate_type1` 相同的键。
+
+**算法：**
+1. 将力矩转移到板面：`Mxp = Mx + Fy*az0`，`Myp = My - Fx*az0`
+2. 计算压力中心：`ax = -Myp/Fz`，`ay = Mxp/Fz`（仅当 |Fz| >= 20N 时有效）
+3. 计算自由垂直力矩：`Tz = Mz - Fy*ax + Fx*ay`
+4. 取反以获得地面反作用力惯例
+
+---
+
+#### `compute_forceplate_type3(channels_8, a, b, az0)`
+
+从 **Type 3**（8 通道 Kistler）计算测力台数据。
+
+Type 3 使用 4 组传感器；首先使用 Kistler 几何参数从原始通道数据计算力和力矩，然后以与 Type 2 相同的方式推导压力中心和自由力矩。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `channels_8` | `ndarray (8, N)` | 通道：`[fx12, fx34, fy14, fy23, fz1, fz2, fz3, fz4]` |
+| `a` | `float` | 局部 Y 方向传感器偏移量（前后方向），mm |
+| `b` | `float` | 局部 X 方向传感器偏移量（内外方向），mm |
+| `az0` | `float` | 顶板偏移量，mm（通常为负值） |
+
+**返回值：** `dict`，与 `compute_forceplate_type1` 相同的键。
 
 **算法：**
 1. 汇总原始通道得到 Fx_raw, Fy_raw, Fz_raw
@@ -337,19 +375,6 @@ R = chain_rotations(('X', -90), ('Y', 90))
 4. 计算压力中心：`ax = -Myp/Fz`，`ay = Mxp/Fz`（仅当 |Fz| >= 20N 时有效）
 5. 计算自由垂直力矩：`Tz = Mz - Fy*ax + Fx*ay`
 6. 取反以获得地面反作用力惯例
-
----
-
-#### `compute_kistler_channel6(channels_6, az0)`
-
-从 **6 通道**测力台数据计算压力中心和自由力矩。
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `channels_6` | `ndarray (6, N)` | 原始通道：`[Fx, Fy, Fz, Mx, My, Mz]` |
-| `az0` | `float` | 顶板偏移量，mm |
-
-**返回值：** `dict`，与 `compute_kistler_channel8` 相同的键。
 
 ---
 
@@ -366,7 +391,7 @@ R = chain_rotations(('X', -90), ('Y', 90))
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `type2` | `dict` | `compute_kistler_channel8` 或 `compute_kistler_channel6` 的输出 |
+| `type2` | `dict` | `compute_forceplate_type1`、`type2` 或 `type3` 的输出 |
 | `corners` | `ndarray (3, 4)` | 来自 C3D `FORCE_PLATFORM:CORNERS` 的测力台角点 |
 
 **返回值：** `dict`，包含键：`Fx`, `Fy`, `Fz` (N), `COPx`, `COPy`, `COPz` (mm), `Tz` (N*mm)

@@ -22,7 +22,7 @@ Available Converters
 Utility Functions (from C3DExport.utils)
 ----------------------------------------
     rotation_matrix, apply_rotation, chain_rotations
-    compute_kistler_channel8, compute_kistler_channel6
+    compute_forceplate_type1, compute_forceplate_type2, compute_forceplate_type3
     plate_local_to_lab, lab_to_opensim_force
     butter_lowpass_filter, resample_to_target_rate
     detect_stance_phase, detect_stance_phase_from_peak
