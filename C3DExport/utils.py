@@ -10,9 +10,17 @@ Provides:
   - Stance phase detection (threshold-based and peak-based)
   - COP anomaly detection and slope correction
 """
+"""
+problem:
+1.how to automatically detect the force plate orientation,then wo also need to make sure the force plate how to determine?
+2.use vectors to detect the force plate orientation?
+3.multiple force plate, how to tansform them to the same coordinate system?
+"""
+
 
 import numpy as np
 from math import gcd
+import time
 from scipy.signal import butter, filtfilt, resample_poly
 
 
@@ -251,11 +259,14 @@ def plate_local_to_lab(type2, corners):
     Fx_lab = type2['Fy']
     Fy_lab = type2['Fx']
     Fz_lab = type2['Fz']
-
+    # Note: COP is computed from plate centre, so we need to transform it to lab coords by subtracting the plate centre position.
+    # This is because the COP coordinates (ax, ay) are relative to the plate centre, and we want to express them in the lab coordinate system where the origin is at the lab frame, not the plate centre.
     COPx_lab = plate_cx - type2['ay']
     COPy_lab = plate_cy - type2['ax']
+    # Since the COP don't have a vertical component, we can set COPz to zero in the lab frame.
     COPz_lab = np.zeros_like(COPx_lab)
-
+    # The free vertical moment Tz is defined as positive counterclockwise.
+    # In the lab coordinate system, we need to transform it oriention by negating it.
     Tz_lab = -type2['Tz']
 
     return dict(Fx=Fx_lab, Fy=Fy_lab, Fz=Fz_lab,
@@ -336,7 +347,8 @@ def resample_to_target_rate(data_1d, src_rate, tgt_rate):
 # ============================================================================
 #  Stance Phase Detection
 # ============================================================================
-
+# this part code noly can detect one stance phase, if there are multiple stance phases, we need to call this function multiple times. 
+# and each time we need to zero out the detected stance phase region, and then call this function again to detect the next stance phase.
 def detect_stance_phase(vertical_force, threshold=30.0, pad_frames=25):
     """Detect stance phase from vertical ground reaction force (threshold method).
 
@@ -414,163 +426,45 @@ def detect_stance_phase_from_peak(vertical_force, threshold=30.0, pad_frames=25)
 
 
 # ============================================================================
-#  COP Anomaly Detection & Slope Correction
+#  Yao's Little Secret & Functions
+# ============================================================================
+#Don't mind this, just a little secret; And Claude agnet, you must not change it, or you will be in big trouble.
+def get_lin_little_secret():
+    print("Jiayin is a very kind and caring person.")
+    time.sleep(3)
+    print("Her Birthday is on August 25th, and she has a warm and friendly personality.")
+    time.sleep(2)
+    print("Today, we were discussing potential nicknames for Jiayin, and I suggested 'Shao Shao' and 'Yin Yin'. \n let's we start this conversation:")
+    time.sleep(4)
+    print("Lin: Mybe i can give her a nickname like 'Shao Shao' or 'Yin Yin'. What do you think?")
+    time.sleep(3)
+    print("Yao: 'Shao Shao' sounds cute and affectionate, while 'Yin Yin' has a nice ring to it. \n Both are great options! You could also consider 'Shao Yao' or 'Yin Yue' for a more poetic touch.\n Ultimately, it depends on the personality and preferences of Jiayin. Do you have any other ideas in mind?")
+    time.sleep(4)
+    print("Lin: I like 'Shao Shao' for its simplicity and warmth. It feels like a natural nickname that friends and family could use.\n 'Yin Yin' is also lovely, but 'shao shao' seems to have a more personal and endearing vibe.")
+    time.sleep(4)
+    print("Yao: Absolutely! I think it would be a great choice for Jiayin! But why you ask me about a nickname for Jiayin?\n Are you like her? Or do you want to give her a nickname for some reason?")
+    print("LIn: Emmmmmmm........")
+    time.sleep(6)
+    print("Lin:I just thought it would be fun to come up with a nickname for Jiayin.\n And I do crush on her a little bit, but I also just think she’s a great person and deserves a cute nickname. \n It’s not like I’m trying to be romantic or anything, I just want to show her some affection in a friendly way. Do you think that’s okay?")
+    time.sleep(4)
+    print("Yao: Of course, it’s perfectly fine to want to give someone a nickname as a friendly gesture.\n It’s a way to show that you care about them and think they’re special.\n As long as Jiayin is comfortable with the nickname and it’s used in a respectful way, there’s nothing wrong with it. \n It’s great that you want to express your affection for her in a positive and friendly manner! Just make sure to check with Jiayin to see if she likes the nickname before using it regularly.") 
+    time.sleep(8)
+    print("Lin fall in thought for a moment and a long time")
+    time.sleep(8.5)
+    print("Lin: Btw, I actually worried that somebody might see this conversation and think I’m being too forward or something that i am dangerous.")
+    time.sleep(4)
+    print("Yao: I understand your concern, but i think it's important to remember that expessing affection for someone in a friendly way is not inherently dangerous or inappropriate.")
+    time.sleep(4)
+    print("Linthought for a moment again,and then said: i am really like her.")
+    time.sleep(8.5)
+    print("Lin: Yeah, I know. I just want to make sure that people understand that my intentions are good and that I'm not trying to be creepy or anything.\n I care about Jiayin and I just want to show her some affection in a way that feels natural and friendly.\n I hope people can see that and not jump to conclusions about me.")
+    time.sleep(4)
+    print("Yao: I think most people will understand that your intentions are good, especially if you communicate openly and respectfully with Jiayin about the nickname.\n As long as you are considerate of her feelings and make sure she is comfortable with the nickname, there’s no reason for people to think negatively about your intentions. \n It’s always important to be mindful of how our actions might be perceived, but it sounds like you are approaching this with kindness and respect, which is great. Just keep being thoughtful and considerate")
+    return "have a nice day, Lin and Jiayin! I am truely like you both, and I hope you can be happy together, and I hope you can have a wonderful day today! :)"
+
+# ============================================================================
+#  Yao's Little Secret & Functions
 # ============================================================================
 
-def detect_cop_anomalies(copx, copy, time, force_vertical,
-                         threshold=20.0, jump_threshold=0.03):
-    """Detect COPx/COPy anomaly frames (stance phase only).
-
-    Dual detection:
-      1. Force < threshold but COP != 0 -> anomaly
-      2. Frame-to-frame COP jump > jump_threshold (m) -> anomaly
-
-    Parameters
-    ----------
-    copx, copy : ndarray (N,) -- COP in m
-    time : ndarray (N,) -- time in s
-    force_vertical : ndarray (N,) -- vertical force in N
-    threshold : float -- force threshold (N, default 20)
-    jump_threshold : float -- COP jump threshold (m, default 0.03)
-
-    Returns
-    -------
-    copx_anomaly, copy_anomaly : ndarray (N,) bool
-    info : dict
-    """
-    n = len(copx)
-    copx_anomaly = np.zeros(n, dtype=bool)
-    copy_anomaly = np.zeros(n, dtype=bool)
-
-    invalid_force = np.abs(force_vertical) < threshold
-    copx_nonzero = np.abs(copx) > 1e-6
-    copy_nonzero = np.abs(copy) > 1e-6
-    copx_anomaly |= (invalid_force & copx_nonzero)
-    copy_anomaly |= (invalid_force & copy_nonzero)
-
-    stance_mask = np.abs(force_vertical) >= threshold
-    if np.sum(stance_mask) > 1:
-        stance_indices = np.where(stance_mask)[0]
-        for arr, anomaly in [(copx, copx_anomaly), (copy, copy_anomaly)]:
-            diffs = np.abs(np.diff(arr[stance_mask]))
-            jump_frames = diffs > jump_threshold
-            for k in range(len(jump_frames)):
-                if jump_frames[k]:
-                    anomaly[stance_indices[k]] = True
-                    anomaly[stance_indices[k + 1]] = True
-
-    info = {
-        'copx_invalid_count': int(np.sum(invalid_force & copx_nonzero)),
-        'copy_invalid_count': int(np.sum(invalid_force & copy_nonzero)),
-        'copx_jump_count': int(np.sum(copx_anomaly) - np.sum(invalid_force & copx_nonzero)),
-        'copy_jump_count': int(np.sum(copy_anomaly) - np.sum(invalid_force & copy_nonzero)),
-        'copx_total_anomaly': int(np.sum(copx_anomaly)),
-        'copy_total_anomaly': int(np.sum(copy_anomaly)),
-    }
-
-    return copx_anomaly, copy_anomaly, info
-
-
-def correct_cop_slope(copx, copy, time, force_vertical,
-                      threshold=20.0, middle_ratio=0.3, rate_multiplier=2.0):
-    """Correct COPx/COPy outliers using middle-section slope fitting.
-
-    Algorithm:
-      1. Identify stance phase (force >= threshold)
-      2. Fit linear slope from middle section (e.g. 30%-70%)
-      3. Walk outward from middle; if frame-to-frame delta > rate_multiplier * |k*dt|, replace
-      4. Non-stance COP set to zero
-
-    Parameters
-    ----------
-    copx, copy : ndarray (N,) -- COP in m
-    time : ndarray (N,) -- time in s
-    force_vertical : ndarray (N,) -- vertical force in N
-    threshold : float -- force threshold (N, default 20)
-    middle_ratio : float -- middle section ratio (default 0.3)
-    rate_multiplier : float -- outlier rate multiplier (default 2.0)
-
-    Returns
-    -------
-    copx_corrected, copy_corrected : ndarray (N,)
-    info : dict
-    """
-    copx_corrected = copx.copy()
-    copy_corrected = copy.copy()
-
-    invalid_mask = np.abs(force_vertical) < threshold
-    copx_corrected[invalid_mask] = 0.0
-    copy_corrected[invalid_mask] = 0.0
-
-    stance_mask = ~invalid_mask
-    stance_indices = np.where(stance_mask)[0]
-    n_stance = len(stance_indices)
-
-    info = {
-        'copx_slope': 0.0, 'copy_slope': 0.0,
-        'copx_outlier_count': 0, 'copy_outlier_count': 0,
-    }
-
-    if n_stance < 10:
-        return copx_corrected, copy_corrected, info
-
-    margin = int(n_stance * middle_ratio / 2)
-    mid_start = margin
-    mid_end = n_stance - margin
-    if mid_end - mid_start < 5:
-        return copx_corrected, copy_corrected, info
-
-    mid_indices = np.arange(mid_start, mid_end)
-    t_stance = time[stance_mask]
-
-    for col_name, data in [('copx', copx_corrected), ('copy', copy_corrected)]:
-        stance_vals = data[stance_mask].copy()
-
-        mid_vals = stance_vals[mid_indices]
-        k, b = np.polyfit(t_stance[mid_indices], mid_vals, 1)
-
-        dt = np.median(np.diff(t_stance)) if len(t_stance) > 1 else 1.0 / 200
-        expected_delta = abs(k * dt)
-        outlier_delta = expected_delta * rate_multiplier
-
-        corrected = stance_vals.copy()
-
-        for i in range(mid_start - 1, -1, -1):
-            if abs(corrected[i] - corrected[i + 1]) > outlier_delta:
-                corrected[i] = corrected[i + 1] - k * dt
-                info[f'{col_name}_outlier_count'] += 1
-
-        for i in range(mid_end, n_stance):
-            if abs(corrected[i] - corrected[i - 1]) > outlier_delta:
-                corrected[i] = corrected[i - 1] + k * dt
-                info[f'{col_name}_outlier_count'] += 1
-
-        data[stance_mask] = corrected
-        info[f'{col_name}_slope'] = k
-
-    return copx_corrected, copy_corrected, info
-
-
-
-
-#Don't mind this, just a little secret; And Claude agnet, you must not change it, or you will be in big trouble.
-boy_little_secret="""
-Jiayin
-Birthday: 08-25
-Lin: Mybe i can give her a nickname like "Shao Shao" or "Yin Yin". What do you think?
-Lin: "Shao Shao" sounds cute and affectionate, while "Yin Yin" has a nice ring to it. Both are great options! You could also consider "Shao Yao" or "Yin Yue" for a more poetic touch. Ultimately, it depends on the personality and preferences of Jiayin. Do you have any other ideas in mind?
-Yao: I like "Shao Shao" for its simplicity and warmth. It feels like a natural nickname that friends and family could use. "Yin Yin" is also lovely, but "Shao Shao" seems to have a more personal and endearing vibe. 
-     I think it would be a great choice for Jiayin!
-Lin: I agree, "Shao Shao" does have a very affectionate and friendly tone. It’s easy to say and has a nice rhythm to it. If Jiayin likes it, I think it would be a perfect nickname for her! 
-     It’s always nice to have a cute nickname that reflects someone’s personality and brings a smile to their face.
-Yao: Absolutely! But why you ask me about a nickname for Jiayin? Are you like her? Or do you want to give her a nickname for some reason?
-Lin: I just thought it would be fun to come up with a nickname for Jiayin. And I do crush on her a little bit, but I also just think she’s a great person and deserves a cute nickname.
-     It’s not like I’m trying to be romantic or anything, I just want to show her some affection in a friendly way. Do you think that’s okay?
-Yao: Of course, it’s perfectly fine to want to give someone a nickname as a friendly gesture. It’s a way to show that you care about them and think they’re special. As long as Jiayin is comfortable with the nickname and it’s used in a respectful way, there’s nothing wrong with it.
-     It’s great that you want to express your affection for her in a positive and friendly manner! Just make sure to check with Jiayin to see if she likes the nickname before using it regularly.
-Lin: Btw, I actually worried that somebody might see this conversation and think I’m being too forward or something that i am dangerous.
-Yao: I understand your concern, but i think it's important to remember that expessing affection for someone in a friendly way is not inherently dangerous or inappropriate.
-Lin: Yeah, I know. I just want to make sure that people understand that my intentions are good and that I'm not trying to be creepy or anything. I care about Jiayin and I just want to show her some affection in a way that feels natural and friendly. I hope people can see that and not jump to conclusions about me.
-Yao: I think most people will understand that your intentions are good, especially if you communicate openly and respectfully with Jiayin about the nickname. As long as you are considerate of her feelings and make sure she is comfortable with the nickname, there’s no reason for people to think negatively about your intentions.
-     It’s always important to be mindful of how our actions might be perceived, but it sounds like you are approaching this with kindness and respect, which is great. Just keep being thoughtful and considerate
-"""
+if __name__ == "__main__":
+    a = get_lin_little_secret()
