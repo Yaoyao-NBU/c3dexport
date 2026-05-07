@@ -463,7 +463,7 @@ def get_lin_little_secret():
     return "have a nice day, Lin and Jiayin! I am truely like you both, and I hope you can be happy together, and I hope you can have a wonderful day today! :)"
 
 # ============================================================================
-#  Yao's Little Secret & Functions
+#  *******************************
 # ============================================================================
 
 if __name__ == "__main__":

@@ -76,7 +76,7 @@ pip install numpy scipy ezc3d pandas
 Clone or copy the `C3DExport` folder into your project directory, then import:
 
 ```python
-from C3DExport import convert_c3d, convert_c3d_v2, convert_c3d6
+from C3DExport import convert_c3d_type1, convert_c3d_type2, convert_c3d_type3
 ```
 
 ---
@@ -84,34 +84,31 @@ from C3DExport import convert_c3d, convert_c3d_v2, convert_c3d6
 ## Quick Start
 
 ```python
-from C3DExport import convert_c3d
+from C3DExport import convert_c3d_type3
 
 # Convert an 8-channel Kistler C3D file
-result = convert_c3d("data/trial.c3d", "output/")
+result = convert_c3d_type3("data/trial.c3d", "output/")
 
 print(result['trc_path'])      # -> "output/trial.trc"
 print(result['mot_path'])      # -> "output/trial.mot"
-print(result['csv_path'])      # -> "output/cut_records.csv"
+print(result['csv_path'])      # -> "output/record.csv"
 print(result['stance_info'])   # -> stance phase metadata dict
 ```
 
-### Using V2 (Peak Stance + COP Correction)
+### Using Type 1 (6-Channel AMTI, Direct COP)
 
 ```python
-from C3DExport import convert_c3d_v2
+from C3DExport import convert_c3d_type1
 
-result = convert_c3d_v2("data/trial.c3d", "output/",
-                         cop_middle_ratio=0.3,
-                         cop_rate_multiplier=2.0,
-                         cop_jump_threshold=0.03)
+result = convert_c3d_type1("data/trial.c3d", "output/")
 ```
 
-### Using 6-Channel Converter
+### Using Type 2 (6-Channel AMTI)
 
 ```python
-from C3DExport import convert_c3d6
+from C3DExport import convert_c3d_type2
 
-result = convert_c3d6("data/trial.c3d", "output/")
+result = convert_c3d_type2("data/trial.c3d", "output/")
 ```
 
 ---
@@ -130,9 +127,9 @@ The core module provides the main conversion pipelines. All three converters fol
 
 ### Main Converter Functions
 
-#### `convert_c3d(c3d_path, output_dir, ...)`
+#### `convert_c3d_type3(c3d_path, output_dir, ...)`
 
-Convert **8-channel Kistler** C3D to OpenSim files using **threshold-based** stance detection.
+Convert **8-channel Kistler (Type 3)** C3D to OpenSim files using **threshold-based** stance detection.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -152,31 +149,29 @@ Convert **8-channel Kistler** C3D to OpenSim files using **threshold-based** sta
 
 ---
 
-#### `convert_c3d_v2(c3d_path, output_dir, ...)`
+#### `convert_c3d_type1(c3d_path, output_dir, ...)`
 
-Convert **8-channel Kistler** C3D to OpenSim files using **peak-based** stance detection with **COP slope correction**.
+Convert **6-channel AMTI (Type 1)** force plate C3D to OpenSim files.
 
-Additional parameters beyond `convert_c3d`:
+Type 1 force plates output forces and COP directly (Px, Py are COP coordinates, Mz is free vertical moment). No moment-to-COP conversion needed.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `cop_middle_ratio` | `float` | `0.3` | Middle section ratio for COP slope fitting (30%-70%) |
-| `cop_rate_multiplier` | `float` | `2.0` | Outlier detection rate multiplier |
-| `cop_jump_threshold` | `float` | `0.03` | Frame-to-frame COP jump threshold (m) |
+| `c3d_path` | `str` | required | Path to the input `.c3d` file with 6-channel Type 1 data |
+| `output_dir` | `str` | required | Directory for output files |
+| `marker_cutoff` | `float` | `6.0` | Marker low-pass filter cutoff frequency (Hz) |
+| `force_cutoff` | `float` | `50.0` | Force low-pass filter cutoff frequency (Hz) |
+| `stance_threshold` | `float` | `30.0` | Vertical force threshold for stance detection (N) |
+| `stance_pad_frames` | `int` | `25` | Padding frames before/after stance phase |
+| `verbose` | `bool` | `True` | Print progress messages to stdout |
 
-**Returns:** `dict` with same keys as `convert_c3d`, plus additional COP correction info in `stance_info`:
-- `peak_frame` (`int`): Frame index of peak vertical force
-- `peak_value` (`float`): Peak vertical force value (N)
-- `copx_slope` (`float`): Fitted COPx slope
-- `copz_slope` (`float`): Fitted COPz slope
-- `copx_outlier_count` (`int`): Number of COPx outlier frames corrected
-- `copz_outlier_count` (`int`): Number of COPz outlier frames corrected
+**Returns:** `dict` with same keys as `convert_c3d_type3`.
 
 ---
 
-#### `convert_c3d6(c3d_path, output_dir, ...)`
+#### `convert_c3d_type2(c3d_path, output_dir, ...)`
 
-Convert **6-channel** force plate C3D to OpenSim files.
+Convert **6-channel AMTI (Type 2)** force plate C3D to OpenSim files.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -188,7 +183,7 @@ Convert **6-channel** force plate C3D to OpenSim files.
 | `stance_pad_frames` | `int` | `25` | Padding frames before/after stance phase |
 | `verbose` | `bool` | `True` | Print progress messages to stdout |
 
-**Returns:** `dict` with same keys as `convert_c3d`.
+**Returns:** `dict` with same keys as `convert_c3d_type3`.
 
 ### Internal Helper Functions
 
@@ -558,7 +553,7 @@ Tab-separated file with:
 - **Column labels:** `time`, `ground_force_vx/vy/vz`, `ground_force_px/py/pz`, `ground_torque_x/y/z`
 - **Data rows:** Time-series of forces (N), COP (m), and torques (N*m)
 
-### `cut_records.csv` (Stance Metadata)
+### `record.csv` (Stance Metadata)
 
 CSV file recording stance phase information for each processed trial:
 - `trial`: Trial name

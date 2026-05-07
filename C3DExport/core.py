@@ -4,9 +4,9 @@ C3DExport.core
 Main conversion pipeline: C3D -> OpenSim .trc + .mot
 
 Provides three converters:
-  - convert_c3d   : 8-channel Kistler Type 3 (standard)
-  - convert_c3d_v2: 8-channel with peak-based stance + COP correction
-  - convert_c3d6  : 6-channel force data (Fx, Fy, Fz, Mx, My, Mz)
+  - convert_c3d_type1: 6-channel AMTI Type 1 (direct COP measurement)
+  - convert_c3d_type2: 6-channel AMTI Type 2 (moment-derived COP)
+  - convert_c3d_type3: 8-channel Kistler Type 3 (threshold stance detection)
 """
 
 import os
@@ -15,11 +15,10 @@ import ezc3d
 
 from .utils import (
     rotation_matrix, apply_rotation,
-    compute_forceplate_type2, compute_forceplate_type3,
+    compute_forceplate_type1, compute_forceplate_type2, compute_forceplate_type3,
     plate_local_to_lab, lab_to_opensim_force,
     butter_lowpass_filter, resample_to_target_rate,
     detect_stance_phase, detect_stance_phase_from_peak,
-    detect_cop_anomalies, correct_cop_slope,
 )
 from .io import write_trc, write_mot
 
@@ -38,7 +37,7 @@ def _read_c3d(c3d_path):
       point_rate, analog_rate, first_frame,
       pt_data, marker_labels, marker_units, n_markers, n_point_frames,
       analog_data, n_analog_frames,
-      n_plates, channels, origin, corners
+      n_plates, channels, origin, corners, fp_types
     """
     c = ezc3d.c3d(c3d_path)
 
@@ -67,6 +66,12 @@ def _read_c3d(c3d_path):
     origin    = fp_params['ORIGIN']['value']
     corners   = np.array(fp_params['CORNERS']['value'])
 
+    try:
+        fp_types = [int(t) for t in fp_params['TYPE']['value']]
+    except KeyError:
+        fp_types = []
+        print(f"  [WARN] FORCE_PLATFORM TYPE parameter not found, defaulting to empty list (missing in {c3d_path})")
+
     return dict(
         point_rate=point_rate, analog_rate=analog_rate, first_frame=first_frame,
         pt_data=pt_data, marker_labels=marker_labels,
@@ -74,8 +79,13 @@ def _read_c3d(c3d_path):
         n_point_frames=n_point_frames,
         analog_data=analog_data, n_analog_frames=n_analog_frames,
         n_plates=n_plates, channels=channels, origin=origin, corners=corners,
+        fp_types=fp_types,
     )
 
+
+# ============================================================================
+#  Shared Helpers
+# ============================================================================
 
 def _resample_analog(analog_data, analog_rate, point_rate, n_point_frames):
     """Resample analog data to marker rate."""
@@ -87,6 +97,35 @@ def _resample_analog(analog_data, analog_rate, point_rate, n_point_frames):
             resampled[ch, :] = rs[:n_target]
         return resampled, point_rate
     return analog_data, analog_rate
+
+
+def _compute_forces(analog_data, channels, origin, n_plates, fp_types):
+    """Dispatch force computation based on force plate type."""
+    if not fp_types:
+        raise ValueError("Cannot determine force plate type (fp_types is empty). "
+                         "Please specify the correct converter manually.")
+
+    fp_type = fp_types[0]
+    if fp_type == 1:
+        return _compute_type1_6ch(analog_data, channels, origin, n_plates)
+    elif fp_type == 2:
+        return _compute_type2_6ch(analog_data, channels, origin, n_plates)
+    elif fp_type == 3:
+        return _compute_type2_8ch(analog_data, channels, origin, n_plates)
+    else:
+        raise ValueError(f"Unsupported force plate type: {fp_type}. "
+                         f"Supported types: 1 (AMTI 6-ch), 2/3 (Kistler 8-ch).")
+
+
+def _compute_type1_6ch(analog_data, channels, origin, n_plates):
+    """Compute force data from 6-channel AMTI raw data (Type 1)."""
+    plate_type1 = []
+    for pi in range(n_plates):
+        ch_idx = channels[:, pi].astype(int) - 1
+        ch6    = analog_data[ch_idx, :]
+        az0    = float(origin[2, pi])
+        plate_type1.append(compute_forceplate_type1(ch6, az0))
+    return plate_type1
 
 
 def _compute_type2_8ch(analog_data, channels, origin, n_plates):
@@ -140,6 +179,35 @@ def _filter_markers(markers_os, n_markers, marker_cutoff, point_rate):
                 markers_os[axis, mi, :], marker_cutoff, point_rate
             )
     return markers_os
+
+
+def _early_pipeline(data, marker_cutoff, force_cutoff, log):
+    """Common pipeline steps: resample, compute forces, transform, filter markers.
+
+    Returns: plate_os, markers_os, R_lab2os, analog_rate
+    """
+    log("\n[Step 2] Resampling analog signals ...")
+    analog_data, analog_rate = _resample_analog(
+        data['analog_data'], data['analog_rate'],
+        data['point_rate'], data['n_point_frames']
+    )
+
+    log("\n[Step 3] Computing forces from raw channels ...")
+    plate_type2 = _compute_forces(
+        analog_data, data['channels'], data['origin'],
+        data['n_plates'], data['fp_types']
+    )
+
+    log("\n[Step 4-5] Coordinate transforms (plate-local -> lab -> OpenSim) ...")
+    plate_os, R_lab2os = _transform_forces(
+        plate_type2, data['corners'], data['n_plates']
+    )
+    markers_os = _rotate_markers(data['pt_data'], data['n_markers'], R_lab2os)
+
+    log(f"\n[Step 6] Marker filtering: {marker_cutoff} Hz ...")
+    markers_os = _filter_markers(markers_os, data['n_markers'], marker_cutoff, data['point_rate'])
+
+    return plate_os, markers_os, R_lab2os, analog_rate
 
 
 def _build_structured_plates_v1(plate_os, n_plates, cop_threshold=20.0):
@@ -216,297 +284,36 @@ def _write_csv_record(csv_path, stance_info):
     )
 
 
+def _write_outputs(output_dir, trial, marker_flat, marker_labels, marker_units,
+                   point_rate, mot_plates, n_plates, csv_path, stance_info, log):
+    """Common output-writing steps for all converters."""
+    trc_path = os.path.join(output_dir, f"{trial}.trc")
+    write_trc(trc_path, marker_flat, marker_labels, point_rate,
+              units=marker_units, orig_start_frame=1)
+
+    mot_path = os.path.join(output_dir, f"{trial}.mot")
+    write_mot(mot_path, mot_plates, n_plates, point_rate,
+              filename=f"{trial}.mot")
+
+    _write_csv_record(csv_path, stance_info)
+
+    log(f"\n{'=' * 60}")
+    log(f"  [DONE] .trc: {trc_path}")
+    log(f"  [DONE] .mot: {mot_path}")
+    log(f"{'=' * 60}")
+
+    return trc_path, mot_path
+
+
 # ============================================================================
 #  Main Conversion Functions
 # ============================================================================
 
-def convert_c3d(c3d_path, output_dir,
-                marker_cutoff=6.0, force_cutoff=50.0,
-                stance_threshold=30.0, stance_pad_frames=25,
-                verbose=True):
-    """Convert 8-channel Kistler C3D to OpenSim .trc + .mot (threshold stance detection).
-
-    Parameters
-    ----------
-    c3d_path : str -- input C3D file path
-    output_dir : str -- output directory
-    marker_cutoff : float -- marker low-pass cutoff (Hz, default 6)
-    force_cutoff : float -- force low-pass cutoff (Hz, default 50)
-    stance_threshold : float -- stance detection force threshold (N, default 30)
-    stance_pad_frames : int -- padding frames before/after stance (default 25)
-    verbose : bool -- print progress messages (default True)
-
-    Returns
-    -------
-    dict with keys: trc_path, mot_path, csv_path, stance_info
-    """
-    def _log(msg):
-        if verbose:
-            print(msg)
-
-    trial = os.path.splitext(os.path.basename(c3d_path))[0]
-    os.makedirs(output_dir, exist_ok=True)
-
-    _log("=" * 60)
-    _log(f"  C3D -> OpenSim Converter")
-    _log(f"  Input : {c3d_path}")
-    _log(f"  Output: {output_dir}")
-    _log("=" * 60)
-
-    # Step 1: Read C3D
-    _log("\n[Step 1] Reading C3D file ...")
-    data = _read_c3d(c3d_path)
-    _log(f"  Markers: {data['n_markers']} markers, {data['n_point_frames']} frames @ {data['point_rate']} Hz")
-    _log(f"  Forces: {data['n_plates']} plate(s), {data['n_analog_frames']} frames @ {data['analog_rate']} Hz")
-
-    # Step 2: Resample
-    _log("\n[Step 2] Resampling analog signals ...")
-    analog_data, analog_rate = _resample_analog(
-        data['analog_data'], data['analog_rate'],
-        data['point_rate'], data['n_point_frames']
-    )
-
-    # Step 3: Kistler Type 3 -> Type 2
-    _log("\n[Step 3] Kistler Type 3 -> Type 2 ...")
-    plate_type2 = _compute_type2_8ch(
-        analog_data, data['channels'], data['origin'], data['n_plates']
-    )
-
-    # Step 4-5: Coordinate transforms
-    _log("\n[Step 4-5] Coordinate transforms (plate-local -> lab -> OpenSim) ...")
-    plate_os, R_lab2os = _transform_forces(
-        plate_type2, data['corners'], data['n_plates']
-    )
-    markers_os = _rotate_markers(data['pt_data'], data['n_markers'], R_lab2os)
-
-    # Step 6: Filter markers
-    _log(f"\n[Step 6] Marker filtering: {marker_cutoff} Hz ...")
-    markers_os = _filter_markers(markers_os, data['n_markers'], marker_cutoff, data['point_rate'])
-
-    # Step 7: COP threshold + unit conversion
-    _log("\n[Step 7] COP threshold & unit conversion ...")
-    structured_plates = _build_structured_plates_v1(plate_os, data['n_plates'])
-
-    # Step 8: Stance detection
-    _log("\n[Step 8] Stance phase detection & extraction ...")
-    active_plate = _detect_active_plate(structured_plates, data['n_plates'])
-    _log(f"  Active plate: FP{active_plate+1}")
-
-    try:
-        start_idx, end_idx, hs_idx, to_idx = detect_stance_phase(
-            structured_plates[active_plate]['Fy'],
-            threshold=stance_threshold, pad_frames=stance_pad_frames,
-        )
-        n_cut = end_idx - start_idx + 1
-        _log(f"  Heel Strike: frame {hs_idx+1}, Toe Off: frame {to_idx+1}")
-        _log(f"  Cut range: {start_idx+1}-{end_idx+1} ({n_cut} frames)")
-
-        structured_plates, _, _ = _cut_and_zero_padding(
-            structured_plates, data['n_plates'],
-            start_idx, end_idx, hs_idx, to_idx
-        )
-        markers_os = markers_os[:, :, start_idx:end_idx+1]
-
-        stance_info = dict(
-            trial=trial, heel_strike_frame=hs_idx+1, toe_off_frame=to_idx+1,
-            cut_start_frame=start_idx+1, cut_end_frame=end_idx+1, total_frames=n_cut,
-        )
-    except ValueError as e:
-        _log(f"  [WARN] {e} -> using all data")
-        n_cut = len(structured_plates[0]['Fy'])
-        stance_info = dict(
-            trial=trial, heel_strike_frame='N/A', toe_off_frame='N/A',
-            cut_start_frame=1, cut_end_frame=n_cut, total_frames=n_cut,
-        )
-
-    # Step 9: Write output files
-    _log("\n[Step 9] Writing OpenSim files ...")
-    marker_flat = _markers_to_flat(markers_os, data['n_markers'])
-
-    trc_path = os.path.join(output_dir, f"{trial}.trc")
-    write_trc(trc_path, marker_flat, data['marker_labels'], data['point_rate'],
-              units=data['marker_units'], orig_start_frame=1)
-
-    mot_plates = _build_mot_plates(structured_plates, data['n_plates'])
-    mot_path = os.path.join(output_dir, f"{trial}.mot")
-    write_mot(mot_path, mot_plates, data['n_plates'], data['point_rate'],
-              filename=f"{trial}.mot")
-
-    csv_path = os.path.join(output_dir, "cut_records.csv")
-    _write_csv_record(csv_path, stance_info)
-
-    _log(f"\n{'=' * 60}")
-    _log(f"  [DONE] .trc: {trc_path}")
-    _log(f"  [DONE] .mot: {mot_path}")
-    _log(f"{'=' * 60}")
-
-    return dict(trc_path=trc_path, mot_path=mot_path, csv_path=csv_path, stance_info=stance_info)
-
-
-def convert_c3d_v2(c3d_path, output_dir,
-                   marker_cutoff=6.0, force_cutoff=50.0,
-                   stance_threshold=30.0, stance_pad_frames=25,
-                   cop_middle_ratio=0.3, cop_rate_multiplier=2.0,
-                   cop_jump_threshold=0.03, verbose=True):
-    """Convert 8-channel Kistler C3D to OpenSim .trc + .mot (peak stance + COP correction).
-
-    Parameters
-    ----------
-    c3d_path : str -- input C3D file path
-    output_dir : str -- output directory
-    marker_cutoff : float -- marker low-pass cutoff (Hz, default 6)
-    force_cutoff : float -- force low-pass cutoff (Hz, default 50)
-    stance_threshold : float -- stance detection force threshold (N, default 30)
-    stance_pad_frames : int -- padding frames (default 25)
-    cop_middle_ratio : float -- COP slope correction middle section ratio (default 0.3)
-    cop_rate_multiplier : float -- COP outlier rate multiplier (default 2.0)
-    cop_jump_threshold : float -- COP frame jump threshold in m (default 0.03)
-    verbose : bool -- print progress messages (default True)
-
-    Returns
-    -------
-    dict with keys: trc_path, mot_path, csv_path, stance_info
-    """
-    def _log(msg):
-        if verbose:
-            print(msg)
-
-    trial = os.path.splitext(os.path.basename(c3d_path))[0]
-    os.makedirs(output_dir, exist_ok=True)
-
-    _log("=" * 60)
-    _log(f"  C3D -> OpenSim V2 (Peak Stance + COP Correction)")
-    _log(f"  Input : {c3d_path}")
-    _log(f"  Output: {output_dir}")
-    _log("=" * 60)
-
-    # Step 1: Read C3D
-    _log("\n[Step 1] Reading C3D file ...")
-    data = _read_c3d(c3d_path)
-    _log(f"  Markers: {data['n_markers']} markers, {data['n_point_frames']} frames @ {data['point_rate']} Hz")
-    _log(f"  Forces: {data['n_plates']} plate(s), {data['n_analog_frames']} frames @ {data['analog_rate']} Hz")
-
-    # Step 2: Resample
-    _log("\n[Step 2] Resampling analog signals ...")
-    analog_data, analog_rate = _resample_analog(
-        data['analog_data'], data['analog_rate'],
-        data['point_rate'], data['n_point_frames']
-    )
-
-    # Step 3: Kistler Type 3 -> Type 2
-    _log("\n[Step 3] Kistler Type 3 -> Type 2 ...")
-    plate_type2 = _compute_type2_8ch(
-        analog_data, data['channels'], data['origin'], data['n_plates']
-    )
-
-    # Step 4-5: Coordinate transforms
-    _log("\n[Step 4-5] Coordinate transforms (plate-local -> lab -> OpenSim) ...")
-    plate_os, R_lab2os = _transform_forces(
-        plate_type2, data['corners'], data['n_plates']
-    )
-    markers_os = _rotate_markers(data['pt_data'], data['n_markers'], R_lab2os)
-
-    # Step 6: Filter markers
-    _log(f"\n[Step 6] Marker filtering: {marker_cutoff} Hz ...")
-    markers_os = _filter_markers(markers_os, data['n_markers'], marker_cutoff, data['point_rate'])
-
-    # Step 7: COP threshold + unit conversion
-    _log("\n[Step 7] COP threshold & unit conversion ...")
-    structured_plates = _build_structured_plates_v1(plate_os, data['n_plates'])
-
-    # Step 8: Peak-based stance detection
-    _log("\n[Step 8] Peak-based stance detection & extraction ...")
-    active_plate = _detect_active_plate(structured_plates, data['n_plates'])
-    _log(f"  Active plate: FP{active_plate+1}")
-
-    try:
-        start_idx, end_idx, hs_idx, to_idx, peak_idx, peak_val = \
-            detect_stance_phase_from_peak(
-                structured_plates[active_plate]['Fy'],
-                threshold=stance_threshold, pad_frames=stance_pad_frames,
-            )
-        n_cut = end_idx - start_idx + 1
-        _log(f"  Peak: {peak_val:.2f}N @ frame {peak_idx+1}")
-        _log(f"  Load (HS): frame {hs_idx+1}, Off (TO): frame {to_idx+1}")
-        _log(f"  Cut range: {start_idx+1}-{end_idx+1} ({n_cut} frames)")
-
-        structured_plates, _, _ = _cut_and_zero_padding(
-            structured_plates, data['n_plates'],
-            start_idx, end_idx, hs_idx, to_idx
-        )
-        markers_os = markers_os[:, :, start_idx:end_idx+1]
-
-        # Step 9: COP anomaly detection & slope correction
-        _log("\n[Step 9] COP anomaly detection & slope correction ...")
-        time_col = np.arange(n_cut) / data['point_rate']
-
-        copx_anomaly, copy_anomaly, anomaly_info = detect_cop_anomalies(
-            structured_plates[active_plate]['COPx'],
-            structured_plates[active_plate]['COPz'],
-            time_col, structured_plates[active_plate]['Fy'],
-            threshold=20.0, jump_threshold=cop_jump_threshold,
-        )
-        _log(f"  Anomalies: COPx={anomaly_info['copx_total_anomaly']}, COPz={anomaly_info['copy_total_anomaly']}")
-
-        copx_corr, copz_corr, slope_info = correct_cop_slope(
-            structured_plates[active_plate]['COPx'],
-            structured_plates[active_plate]['COPz'],
-            time_col, structured_plates[active_plate]['Fy'],
-            threshold=20.0, middle_ratio=cop_middle_ratio,
-            rate_multiplier=cop_rate_multiplier,
-        )
-        structured_plates[active_plate]['COPx'] = copx_corr
-        structured_plates[active_plate]['COPz'] = copz_corr
-        _log(f"  Slope correction: COPx={slope_info['copx_outlier_count']} frames, COPz={slope_info['copy_outlier_count']} frames")
-
-        stance_info = dict(
-            trial=trial, heel_strike_frame=hs_idx+1, toe_off_frame=to_idx+1,
-            cut_start_frame=start_idx+1, cut_end_frame=end_idx+1, total_frames=n_cut,
-            peak_frame=peak_idx+1, peak_value=round(peak_val, 2),
-            copx_slope=round(slope_info['copx_slope'], 6),
-            copz_slope=round(slope_info['copy_slope'], 6),
-            copx_outlier_count=slope_info['copx_outlier_count'],
-            copz_outlier_count=slope_info['copy_outlier_count'],
-        )
-    except ValueError as e:
-        _log(f"  [WARN] {e} -> using all data")
-        n_cut = len(structured_plates[0]['Fy'])
-        stance_info = dict(
-            trial=trial, heel_strike_frame='N/A', toe_off_frame='N/A',
-            cut_start_frame=1, cut_end_frame=n_cut, total_frames=n_cut,
-            peak_frame='N/A', peak_value='N/A',
-            copx_slope=0, copz_slope=0, copx_outlier_count=0, copz_outlier_count=0,
-        )
-
-    # Step 10: Write output files
-    _log("\n[Step 10] Writing OpenSim files ...")
-    marker_flat = _markers_to_flat(markers_os, data['n_markers'])
-
-    trc_path = os.path.join(output_dir, f"{trial}.trc")
-    write_trc(trc_path, marker_flat, data['marker_labels'], data['point_rate'],
-              units=data['marker_units'], orig_start_frame=1)
-
-    mot_plates = _build_mot_plates(structured_plates, data['n_plates'])
-    mot_path = os.path.join(output_dir, f"{trial}.mot")
-    write_mot(mot_path, mot_plates, data['n_plates'], data['point_rate'],
-              filename=f"{trial}.mot")
-
-    csv_path = os.path.join(output_dir, "cut_records_v2.csv")
-    _write_csv_record(csv_path, stance_info)
-
-    _log(f"\n{'=' * 60}")
-    _log(f"  [DONE] .trc: {trc_path}")
-    _log(f"  [DONE] .mot: {mot_path}")
-    _log(f"{'=' * 60}")
-
-    return dict(trc_path=trc_path, mot_path=mot_path, csv_path=csv_path, stance_info=stance_info)
-
-
-def convert_c3d6(c3d_path, output_dir,
-                 marker_cutoff=6.0, force_cutoff=50.0,
-                 stance_threshold=30.0, stance_pad_frames=25,
-                 verbose=True):
-    """Convert 6-channel C3D to OpenSim .trc + .mot.
+def convert_c3d_type2(c3d_path, output_dir,
+                      marker_cutoff=6.0, force_cutoff=50.0,
+                      stance_threshold=30.0, stance_pad_frames=25,
+                      verbose=True):
+    """Convert 6-channel AMTI (Type 2) C3D to OpenSim .trc + .mot.
 
     Parameters
     ----------
@@ -530,7 +337,7 @@ def convert_c3d6(c3d_path, output_dir,
     os.makedirs(output_dir, exist_ok=True)
 
     _log("=" * 60)
-    _log(f"  C3D (6-Channel) -> OpenSim Converter")
+    _log(f"  C3D (6-Channel AMTI Type 2) -> OpenSim Converter")
     _log(f"  Input : {c3d_path}")
     _log(f"  Output: {output_dir}")
     _log("=" * 60)
@@ -540,19 +347,12 @@ def convert_c3d6(c3d_path, output_dir,
     data = _read_c3d(c3d_path)
     _log(f"  Markers: {data['n_markers']} markers, {data['n_point_frames']} frames @ {data['point_rate']} Hz")
     _log(f"  Forces: {data['n_plates']} plate(s), {data['n_analog_frames']} frames @ {data['analog_rate']} Hz")
+    _log(f"  Force plate types: {data['fp_types']}")
 
-    # Step 2: 6-channel force processing
-    _log("\n[Step 2] 6-channel force plate processing ...")
-    plate_type2 = _compute_type2_6ch(
-        data['analog_data'], data['channels'], data['origin'], data['n_plates']
+    # Step 2-6: Common pipeline
+    plate_os, markers_os, R_lab2os, analog_rate = _early_pipeline(
+        data, marker_cutoff, force_cutoff, _log
     )
-
-    # Step 3-4: Coordinate transforms
-    _log("\n[Step 3-4] Coordinate transforms (plate-local -> lab -> OpenSim) ...")
-    plate_os, R_lab2os = _transform_forces(
-        plate_type2, data['corners'], data['n_plates']
-    )
-    markers_os = _rotate_markers(data['pt_data'], data['n_markers'], R_lab2os)
 
     # Step 5-6: Restructure + unit conversion
     _log("\n[Step 5-6] Force array restructuring & unit conversion ...")
@@ -585,13 +385,13 @@ def convert_c3d6(c3d_path, output_dir,
                     resampled[:, col] = rs[:n_target]
                 structured_plates[pi][key] = resampled
 
-    markers_os = _filter_markers(markers_os, data['n_markers'], marker_cutoff, data['point_rate'])
-
     # Step 8: Stance detection
     _log("\n[Step 8] Stance phase detection & extraction ...")
     max_fy = [np.max(np.abs(structured_plates[pi]['force'][:, 1])) for pi in range(data['n_plates'])]
     active_plate = int(np.argmax(max_fy))
     _log(f"  Active plate: FP{active_plate+1}")
+
+    csv_path = os.path.join(output_dir, "record.csv")
 
     try:
         start_idx, end_idx, hs_idx, to_idx = detect_stance_phase(
@@ -630,21 +430,239 @@ def convert_c3d6(c3d_path, output_dir,
     # Step 9: Write output files
     _log("\n[Step 9] Writing OpenSim files ...")
     marker_flat = _markers_to_flat(markers_os, data['n_markers'])
+    trc_path, mot_path = _write_outputs(
+        output_dir, trial, marker_flat, data['marker_labels'], data['marker_units'],
+        data['point_rate'], structured_plates, data['n_plates'],
+        csv_path, stance_info, _log
+    )
 
-    trc_path = os.path.join(output_dir, f"{trial}.trc")
-    write_trc(trc_path, marker_flat, data['marker_labels'], data['point_rate'],
-              units=data['marker_units'], orig_start_frame=1)
+    return dict(trc_path=trc_path, mot_path=mot_path, csv_path=csv_path, stance_info=stance_info)
 
-    mot_path = os.path.join(output_dir, f"{trial}.mot")
-    write_mot(mot_path, structured_plates, data['n_plates'], data['point_rate'],
-              filename=f"{trial}.mot")
 
-    csv_path = os.path.join(output_dir, "cut_records.csv")
-    _write_csv_record(csv_path, stance_info)
+def convert_c3d_type3(c3d_path, output_dir,
+                      marker_cutoff=6.0, force_cutoff=50.0,
+                      stance_threshold=30.0, stance_pad_frames=25,
+                      verbose=True):
+    """Convert 8-channel Kistler (Type 3) C3D to OpenSim .trc + .mot (threshold stance detection).
 
-    _log(f"\n{'=' * 60}")
-    _log(f"  [DONE] .trc: {trc_path}")
-    _log(f"  [DONE] .mot: {mot_path}")
-    _log(f"{'=' * 60}")
+    Parameters
+    ----------
+    c3d_path : str -- input C3D file path
+    output_dir : str -- output directory
+    marker_cutoff : float -- marker low-pass cutoff (Hz, default 6)
+    force_cutoff : float -- force low-pass cutoff (Hz, default 50)
+    stance_threshold : float -- stance detection force threshold (N, default 30)
+    stance_pad_frames : int -- padding frames before/after stance (default 25)
+    verbose : bool -- print progress messages (default True)
+
+    Returns
+    -------
+    dict with keys: trc_path, mot_path, csv_path, stance_info
+    """
+    def _log(msg):
+        if verbose:
+            print(msg)
+
+    trial = os.path.splitext(os.path.basename(c3d_path))[0]
+    os.makedirs(output_dir, exist_ok=True)
+
+    _log("=" * 60)
+    _log(f"  C3D (8-Channel Kistler Type 3) -> OpenSim Converter")
+    _log(f"  Input : {c3d_path}")
+    _log(f"  Output: {output_dir}")
+    _log("=" * 60)
+
+    # Step 1: Read C3D
+    _log("\n[Step 1] Reading C3D file ...")
+    data = _read_c3d(c3d_path)
+    _log(f"  Markers: {data['n_markers']} markers, {data['n_point_frames']} frames @ {data['point_rate']} Hz")
+    _log(f"  Forces: {data['n_plates']} plate(s), {data['n_analog_frames']} frames @ {data['analog_rate']} Hz")
+    _log(f"  Force plate types: {data['fp_types']}")
+
+    # Step 2-6: Common pipeline
+    plate_os, markers_os, R_lab2os, analog_rate = _early_pipeline(
+        data, marker_cutoff, force_cutoff, _log
+    )
+
+    # Step 7: COP threshold + unit conversion
+    _log("\n[Step 7] COP threshold & unit conversion ...")
+    structured_plates = _build_structured_plates_v1(plate_os, data['n_plates'])
+
+    # Step 8: Stance detection
+    _log("\n[Step 8] Stance phase detection & extraction ...")
+    active_plate = _detect_active_plate(structured_plates, data['n_plates'])
+    _log(f"  Active plate: FP{active_plate+1}")
+
+    csv_path = os.path.join(output_dir, "record.csv")
+
+    try:
+        start_idx, end_idx, hs_idx, to_idx = detect_stance_phase(
+            structured_plates[active_plate]['Fy'],
+            threshold=stance_threshold, pad_frames=stance_pad_frames,
+        )
+        n_cut = end_idx - start_idx + 1
+        _log(f"  Heel Strike: frame {hs_idx+1}, Toe Off: frame {to_idx+1}")
+        _log(f"  Cut range: {start_idx+1}-{end_idx+1} ({n_cut} frames)")
+
+        structured_plates, _, _ = _cut_and_zero_padding(
+            structured_plates, data['n_plates'],
+            start_idx, end_idx, hs_idx, to_idx
+        )
+        markers_os = markers_os[:, :, start_idx:end_idx+1]
+
+        stance_info = dict(
+            trial=trial, heel_strike_frame=hs_idx+1, toe_off_frame=to_idx+1,
+            cut_start_frame=start_idx+1, cut_end_frame=end_idx+1, total_frames=n_cut,
+        )
+    except ValueError as e:
+        _log(f"  [WARN] {e} -> using all data")
+        n_cut = len(structured_plates[0]['Fy'])
+        stance_info = dict(
+            trial=trial, heel_strike_frame='N/A', toe_off_frame='N/A',
+            cut_start_frame=1, cut_end_frame=n_cut, total_frames=n_cut,
+        )
+
+    # Step 9: Write output files
+    _log("\n[Step 9] Writing OpenSim files ...")
+    marker_flat = _markers_to_flat(markers_os, data['n_markers'])
+    mot_plates = _build_mot_plates(structured_plates, data['n_plates'])
+    trc_path, mot_path = _write_outputs(
+        output_dir, trial, marker_flat, data['marker_labels'], data['marker_units'],
+        data['point_rate'], mot_plates, data['n_plates'],
+        csv_path, stance_info, _log
+    )
+
+    return dict(trc_path=trc_path, mot_path=mot_path, csv_path=csv_path, stance_info=stance_info)
+
+
+def convert_c3d_type1(c3d_path, output_dir,
+                      marker_cutoff=6.0, force_cutoff=50.0,
+                      stance_threshold=30.0, stance_pad_frames=25,
+                      verbose=True):
+    """Convert 6-channel AMTI (Type 1) C3D to OpenSim .trc + .mot.
+
+    Type 1 force plates output forces and COP directly (Px, Py are COP
+    coordinates, Mz is free vertical moment). No moment-to-COP conversion.
+
+    Parameters
+    ----------
+    c3d_path : str -- input C3D file with 6-channel Type 1 force data
+    output_dir : str -- output directory
+    marker_cutoff : float -- marker low-pass cutoff (Hz, default 6)
+    force_cutoff : float -- force low-pass cutoff (Hz, default 50)
+    stance_threshold : float -- stance detection force threshold (N, default 30)
+    stance_pad_frames : int -- padding frames (default 25)
+    verbose : bool -- print progress messages (default True)
+
+    Returns
+    -------
+    dict with keys: trc_path, mot_path, csv_path, stance_info
+    """
+    def _log(msg):
+        if verbose:
+            print(msg)
+
+    trial = os.path.splitext(os.path.basename(c3d_path))[0]
+    os.makedirs(output_dir, exist_ok=True)
+
+    _log("=" * 60)
+    _log(f"  C3D (6-Channel AMTI Type 1) -> OpenSim Converter")
+    _log(f"  Input : {c3d_path}")
+    _log(f"  Output: {output_dir}")
+    _log("=" * 60)
+
+    # Step 1: Read C3D
+    _log("\n[Step 1] Reading C3D file ...")
+    data = _read_c3d(c3d_path)
+    _log(f"  Markers: {data['n_markers']} markers, {data['n_point_frames']} frames @ {data['point_rate']} Hz")
+    _log(f"  Forces: {data['n_plates']} plate(s), {data['n_analog_frames']} frames @ {data['analog_rate']} Hz")
+    _log(f"  Force plate types: {data['fp_types']}")
+
+    # Step 2-6: Common pipeline
+    plate_os, markers_os, R_lab2os, analog_rate = _early_pipeline(
+        data, marker_cutoff, force_cutoff, _log
+    )
+
+    # Step 5-6: Restructure + unit conversion
+    _log("\n[Step 5-6] Force array restructuring & unit conversion ...")
+    structured_plates = []
+    for pi in range(data['n_plates']):
+        d = plate_os[pi]
+        n = len(d['Fx'])
+        force  = np.column_stack([d['Fx'], d['Fy'], d['Fz']])
+        cop    = np.column_stack([d['COPx'] / 1000.0, d['COPy'] / 1000.0, d['COPz'] / 1000.0])
+        torque = np.column_stack([np.zeros(n), d['Tz'] / 1000.0, np.zeros(n)])
+        structured_plates.append(dict(force=force, cop=cop, torque=torque))
+
+    # Step 7: Filter & resample
+    _log("\n[Step 7] Filtering & resampling ...")
+    for pi in range(data['n_plates']):
+        for key in ('force', 'cop', 'torque'):
+            arr = structured_plates[pi][key]
+            for col in range(arr.shape[1]):
+                if np.any(arr[:, col] != 0):
+                    arr[:, col] = butter_lowpass_filter(arr[:, col], force_cutoff, data['analog_rate'])
+
+    if data['analog_rate'] != data['point_rate']:
+        for pi in range(data['n_plates']):
+            for key in ('force', 'cop', 'torque'):
+                arr = structured_plates[pi][key]
+                n_target = data['n_point_frames']
+                resampled = np.zeros((n_target, arr.shape[1]))
+                for col in range(arr.shape[1]):
+                    rs = resample_to_target_rate(arr[:, col], data['analog_rate'], data['point_rate'])
+                    resampled[:, col] = rs[:n_target]
+                structured_plates[pi][key] = resampled
+
+    # Step 8: Stance detection
+    _log("\n[Step 8] Stance phase detection & extraction ...")
+    max_fy = [np.max(np.abs(structured_plates[pi]['force'][:, 1])) for pi in range(data['n_plates'])]
+    active_plate = int(np.argmax(max_fy))
+    _log(f"  Active plate: FP{active_plate+1}")
+
+    csv_path = os.path.join(output_dir, "record.csv")
+
+    try:
+        start_idx, end_idx, hs_idx, to_idx = detect_stance_phase(
+            structured_plates[active_plate]['force'][:, 1],
+            threshold=stance_threshold, pad_frames=stance_pad_frames,
+        )
+        n_cut = end_idx - start_idx + 1
+        _log(f"  Heel Strike: frame {hs_idx+1}, Toe Off: frame {to_idx+1}")
+        _log(f"  Cut range: {start_idx+1}-{end_idx+1} ({n_cut} frames)")
+
+        for pi in range(data['n_plates']):
+            for key in ('force', 'cop', 'torque'):
+                structured_plates[pi][key] = structured_plates[pi][key][start_idx:end_idx+1, :]
+
+        rel_hs = hs_idx - start_idx
+        rel_to = to_idx - start_idx
+        for pi in range(data['n_plates']):
+            for key in ('force', 'cop', 'torque'):
+                structured_plates[pi][key][:rel_hs, :] = 0
+                structured_plates[pi][key][rel_to+1:, :] = 0
+
+        markers_os = markers_os[:, :, start_idx:end_idx+1]
+
+        stance_info = dict(
+            trial=trial, heel_strike_frame=hs_idx+1, toe_off_frame=to_idx+1,
+            cut_start_frame=start_idx+1, cut_end_frame=end_idx+1, total_frames=n_cut,
+        )
+    except ValueError as e:
+        _log(f"  [WARN] {e} -> using all data")
+        n_cut = structured_plates[0]['force'].shape[0]
+        stance_info = dict(
+            trial=trial, heel_strike_frame='N/A', toe_off_frame='N/A',
+            cut_start_frame=1, cut_end_frame=n_cut, total_frames=n_cut,
+        )
+
+    # Step 9: Write output files
+    _log("\n[Step 9] Writing OpenSim files ...")
+    marker_flat = _markers_to_flat(markers_os, data['n_markers'])
+    trc_path, mot_path = _write_outputs(
+        output_dir, trial, marker_flat, data['marker_labels'], data['marker_units'],
+        data['point_rate'], structured_plates, data['n_plates'],
+        csv_path, stance_info, _log
+    )
 
     return dict(trc_path=trc_path, mot_path=mot_path, csv_path=csv_path, stance_info=stance_info)

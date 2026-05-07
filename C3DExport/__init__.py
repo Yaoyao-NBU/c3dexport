@@ -7,17 +7,17 @@ Convert C3D biomechanics motion capture files to OpenSim-compatible
 
 Quick Start
 -----------
-    from C3DExport import convert_c3d
+    from C3DExport import convert_c3d_type3
 
-    result = convert_c3d("data/trial.c3d", "output/")
+    result = convert_c3d_type3("data/trial.c3d", "output/")
     print(result['trc_path'])
     print(result['mot_path'])
 
 Available Converters
 --------------------
-    convert_c3d     -- 8-channel Kistler (threshold stance detection)
-    convert_c3d_v2  -- 8-channel Kistler (peak stance + COP correction)
-    convert_c3d6    -- 6-channel force data
+    convert_c3d_type1 -- 6-channel AMTI Type 1 (direct COP measurement)
+    convert_c3d_type2 -- 6-channel AMTI Type 2 (moment-derived COP)
+    convert_c3d_type3 -- 8-channel Kistler Type 3 (threshold stance detection)
 
 Utility Functions (from C3DExport.utils)
 ----------------------------------------
@@ -33,12 +33,12 @@ I/O Functions (from C3DExport.io)
     write_trc, write_mot
 """
 
-from .core import convert_c3d, convert_c3d_v2, convert_c3d6
+from .core import convert_c3d_type1, convert_c3d_type2, convert_c3d_type3
 
 __all__ = [
-    'convert_c3d',
-    'convert_c3d_v2',
-    'convert_c3d6',
+    'convert_c3d_type1',
+    'convert_c3d_type2',
+    'convert_c3d_type3',
 ]
 
 __version__ = '1.0.0'
