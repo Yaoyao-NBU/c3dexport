@@ -182,29 +182,37 @@ def _filter_markers(markers_os, n_markers, marker_cutoff, point_rate):
 
 
 def _early_pipeline(data, marker_cutoff, force_cutoff, log):
-    """Common pipeline steps: resample, compute forces, transform, filter markers.
+    """Common pipeline steps: filter analog, resample, compute forces, transform, filter markers.
 
     Returns: plate_os, markers_os, R_lab2os, analog_rate
     """
-    log("\n[Step 2] Resampling analog signals ...")
+    # Filter raw analog channels at original rate (before resampling)
+    log("\n[Step 2] Filtering analog signals ...")
+    for ch in range(data['analog_data'].shape[0]):
+        if np.any(data['analog_data'][ch, :] != 0):
+            data['analog_data'][ch, :] = butter_lowpass_filter(
+                data['analog_data'][ch, :], force_cutoff, data['analog_rate']
+            )
+
+    log("\n[Step 3] Resampling analog signals ...")
     analog_data, analog_rate = _resample_analog(
         data['analog_data'], data['analog_rate'],
         data['point_rate'], data['n_point_frames']
     )
 
-    log("\n[Step 3] Computing forces from raw channels ...")
+    log("\n[Step 4] Computing forces from raw channels ...")
     plate_type2 = _compute_forces(
         analog_data, data['channels'], data['origin'],
         data['n_plates'], data['fp_types']
     )
 
-    log("\n[Step 4-5] Coordinate transforms (plate-local -> lab -> OpenSim) ...")
+    log("\n[Step 5-6] Coordinate transforms (plate-local -> lab -> OpenSim) ...")
     plate_os, R_lab2os = _transform_forces(
         plate_type2, data['corners'], data['n_plates']
     )
     markers_os = _rotate_markers(data['pt_data'], data['n_markers'], R_lab2os)
 
-    log(f"\n[Step 6] Marker filtering: {marker_cutoff} Hz ...")
+    log(f"\n[Step 7] Marker filtering: {marker_cutoff} Hz ...")
     markers_os = _filter_markers(markers_os, data['n_markers'], marker_cutoff, data['point_rate'])
 
     return plate_os, markers_os, R_lab2os, analog_rate
@@ -364,26 +372,6 @@ def convert_c3d_type2(c3d_path, output_dir,
         cop    = np.column_stack([d['COPx'] / 1000.0, d['COPy'] / 1000.0, d['COPz'] / 1000.0])
         torque = np.column_stack([np.zeros(n), d['Tz'] / 1000.0, np.zeros(n)])
         structured_plates.append(dict(force=force, cop=cop, torque=torque))
-
-    # Step 7: Filter & resample
-    _log("\n[Step 7] Filtering & resampling ...")
-    for pi in range(data['n_plates']):
-        for key in ('force', 'cop', 'torque'):
-            arr = structured_plates[pi][key]
-            for col in range(arr.shape[1]):
-                if np.any(arr[:, col] != 0):
-                    arr[:, col] = butter_lowpass_filter(arr[:, col], force_cutoff, data['analog_rate'])
-
-    if data['analog_rate'] != data['point_rate']:
-        for pi in range(data['n_plates']):
-            for key in ('force', 'cop', 'torque'):
-                arr = structured_plates[pi][key]
-                n_target = data['n_point_frames']
-                resampled = np.zeros((n_target, arr.shape[1]))
-                for col in range(arr.shape[1]):
-                    rs = resample_to_target_rate(arr[:, col], data['analog_rate'], data['point_rate'])
-                    resampled[:, col] = rs[:n_target]
-                structured_plates[pi][key] = resampled
 
     # Step 8: Stance detection
     _log("\n[Step 8] Stance phase detection & extraction ...")
@@ -593,26 +581,6 @@ def convert_c3d_type1(c3d_path, output_dir,
         cop    = np.column_stack([d['COPx'] / 1000.0, d['COPy'] / 1000.0, d['COPz'] / 1000.0])
         torque = np.column_stack([np.zeros(n), d['Tz'] / 1000.0, np.zeros(n)])
         structured_plates.append(dict(force=force, cop=cop, torque=torque))
-
-    # Step 7: Filter & resample
-    _log("\n[Step 7] Filtering & resampling ...")
-    for pi in range(data['n_plates']):
-        for key in ('force', 'cop', 'torque'):
-            arr = structured_plates[pi][key]
-            for col in range(arr.shape[1]):
-                if np.any(arr[:, col] != 0):
-                    arr[:, col] = butter_lowpass_filter(arr[:, col], force_cutoff, data['analog_rate'])
-
-    if data['analog_rate'] != data['point_rate']:
-        for pi in range(data['n_plates']):
-            for key in ('force', 'cop', 'torque'):
-                arr = structured_plates[pi][key]
-                n_target = data['n_point_frames']
-                resampled = np.zeros((n_target, arr.shape[1]))
-                for col in range(arr.shape[1]):
-                    rs = resample_to_target_rate(arr[:, col], data['analog_rate'], data['point_rate'])
-                    resampled[:, col] = rs[:n_target]
-                structured_plates[pi][key] = resampled
 
     # Step 8: Stance detection
     _log("\n[Step 8] Stance phase detection & extraction ...")
