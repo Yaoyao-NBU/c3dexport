@@ -70,9 +70,9 @@ def chain_rotations(*rotations):
     -------
     R : ndarray (3, 3) -- combined rotation matrix (applied left-to-right)
     """
-    R = np.eye(3)
+    R = np.eye(3) # create an identity matrix (I matrix) as the initial rotation
     for axis, angle in rotations:
-        R = rotation_matrix(axis, angle) @ R
+        R = rotation_matrix(axis, angle) @ R   # 矩阵乘法解决旋转顺序问题，确保按输入顺序应用旋转。 @ is matrix multiplication operator in Python 3.5+
     return R
 
 
@@ -238,11 +238,65 @@ def compute_forceplate_type3(channels_8, a, b, az0):
 #  Coordinate Transforms
 # ============================================================================
 
-def plate_local_to_lab(type2, corners):
-    """Convert force data from Kistler plate-local to lab global.
+def compute_plate_rotation(corners):
+    """Derive rotation matrix R (plate-local -> lab) from four corner points.
 
-    Kistler local:  X=right+,    Y=posterior+, Z=down+
-    Lab global:     X=forward+,  Y=left+,      Z=up+
+    Algorithm (per Rotation_implement.md):
+      1. v_x = C2 - C1,  v_y = C4 - C1        (C1..C4 = corners 0..3)
+      2. i_hat = normalise(v_x)                  (local X axis)
+      3. k_hat = normalise(v_x x v_y)            (plate normal, local Z)
+      4. j_hat = k_hat x i_hat                   (orthogonalised local Y)
+      5. R = [i_hat | j_hat | k_hat]             (columns)
+
+    The orthogonalisation in step 4 eliminates non-right-angle manufacturing
+    error from the raw corner positions.
+
+    Parameters
+    ----------
+    corners : ndarray (3, 4) -- FORCE_PLATFORM:CORNERS for one plate
+
+    Returns
+    -------
+    R_plate2lab : ndarray (3, 3)
+    P_center    : ndarray (3,)
+    """
+    _NORM_GUARD = 1e-6
+
+    # Step 1: basis vectors
+    v_x = corners[:, 1] - corners[:, 0]   # C1 -> C2
+    v_y = corners[:, 3] - corners[:, 0]   # C1 -> C4
+
+    # Step 2: normalise v_x -> i_hat
+    nx = np.linalg.norm(v_x)
+    if nx < _NORM_GUARD:
+        raise ValueError(f"Degenerate corner edge C1->C2 (norm={nx:.2e})")
+    i_hat = v_x / nx
+
+    # Step 3: cross product -> k_hat (plate normal)
+    v_z = np.cross(v_x, v_y)
+    nz = np.linalg.norm(v_z)
+    if nz < _NORM_GUARD:
+        raise ValueError(f"Degenerate corner edge C1->C4 (norm={nz:.2e})")
+    k_hat = v_z / nz
+
+    # Step 4: orthogonalise Y axis
+    j_hat = np.cross(k_hat, i_hat)
+
+    # Step 5: assemble rotation matrix
+    R_plate2lab = np.column_stack([i_hat, j_hat, k_hat])
+
+    # Plate centre (translation vector)
+    P_center = np.mean(corners, axis=1)
+
+    return R_plate2lab, P_center
+
+
+def plate_local_to_lab(type2, corners):
+    """Convert force data from plate-local to lab global using corner geometry.
+
+    Uses :func:`compute_plate_rotation` to derive R from the four corner
+    points, then applies the affine transform  p_lab = R @ p_plate + P_center
+    to forces, COP, and free vertical moment.
 
     Parameters
     ----------
@@ -253,25 +307,29 @@ def plate_local_to_lab(type2, corners):
     -------
     dict  Fx, Fy, Fz (N), COPx, COPy, COPz (mm), Tz (N*mm)
     """
-    plate_cx = np.mean(corners[0, :])
-    plate_cy = np.mean(corners[1, :])
+    #use the function to compute the rotation matrix and the center of the plate(above function compute_plate_rotation)
+    R, P_center = compute_plate_rotation(corners) 
 
-    Fx_lab = type2['Fy']
-    Fy_lab = type2['Fx']
-    Fz_lab = type2['Fz']
-    # Note: COP is computed from plate centre, so we need to transform it to lab coords by subtracting the plate centre position.
-    # This is because the COP coordinates (ax, ay) are relative to the plate centre, and we want to express them in the lab coordinate system where the origin is at the lab frame, not the plate centre.
-    COPx_lab = plate_cx - type2['ay']
-    COPy_lab = plate_cy - type2['ax']
-    # Since the COP don't have a vertical component, we can set COPz to zero in the lab frame.
-    COPz_lab = np.zeros_like(COPx_lab)
-    # The free vertical moment Tz is defined as positive counterclockwise.
-    # In the lab coordinate system, we need to transform it oriention by negating it.
-    Tz_lab = -type2['Tz']
+    # --- Forces: rotate from plate-local to lab ---
+    F_plate = np.vstack([type2['Fx'], type2['Fy'], type2['Fz']])  # (3, N)
+    F_lab = R @ F_plate  # (3, N)
 
-    return dict(Fx=Fx_lab, Fy=Fy_lab, Fz=Fz_lab,
-                COPx=COPx_lab, COPy=COPy_lab, COPz=COPz_lab,
-                Tz=Tz_lab)
+    # --- COP: rotate offset from plate-local, then translate to lab ---
+    cop_offset = np.vstack([type2['ax'], type2['ay'],
+                            np.zeros_like(type2['ax'])])  # (3, N)
+    cop_lab = R @ cop_offset + P_center[:, np.newaxis]  # (3, N)
+
+    # --- Free vertical moment: rotate from plate-local to lab ---
+    Tz_plate = np.vstack([np.zeros_like(type2['Tz']),
+                          np.zeros_like(type2['Tz']),
+                          type2['Tz']])  # (3, N)
+    Tz_lab = (R @ Tz_plate)[2, :]  # Z-component in lab frame
+
+    return dict(
+        Fx   = F_lab[0],    Fy   = F_lab[1],    Fz   = F_lab[2],
+        COPx = cop_lab[0],  COPy = cop_lab[1],  COPz = cop_lab[2],
+        Tz   = Tz_lab,
+    )
 
 
 def lab_to_opensim_force(data_lab):
